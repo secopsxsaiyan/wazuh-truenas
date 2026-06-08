@@ -1,0 +1,98 @@
+<!--
+  TrueNAS SCALE syslog -> Wazuh decoders.
+  Source: a TrueNAS SCALE host sending RFC5424 syslog over TCP/514 to the Wazuh manager
+          (a <remote><connection>syslog</connection> block in the manager config).
+
+  >> SUBSTITUTE FOR YOUR ENVIRONMENT: these decoders anchor on the TrueNAS syslog HOSTNAME token,
+     shown throughout as 'true' (an example short hostname). Replace 'true' in every prematch below
+     with your TrueNAS host's syslog hostname (e.g. 'truenas'), and set your own <TRUENAS IP> /
+     <LAN CIDR> in the manager's syslog <remote> allowed-ips.
+
+  WIRE/DELIVERY FORM (ground-truthed from logall_json archives):
+    wazuh-remoted does NOT de-frame RFC6587 octet-counting and does NOT strip <PRI>, so the
+    string analysisd actually sees is:
+        <OCTET-COUNT> <PRI>1 <ISO8601-ts> true <APP> <PROCID> <MSGID> <STRUCTURED-DATA> <MSG>
+        e.g.  693 <10>1 2026-06-04T11:14:45-04:00 true TNAUDIT_SYSTEM - - [meta sequenceId="9"] @cee:{...}
+              128 <86>1 2026-06-04T11:14:26-04:00 true ed 1284 - - pam_unix(truenas-unix:session): session opened ...
+              192 <38>1 2026-06-04T11:39:26-04:00 true sshd-session 961768 - - Accepted publickey for X from Y port N
+    The default pre-decoder can't parse the ISO8601 stamp, so hostname/program_name come back
+    EMPTY and no stock decoder matches. These decoders re-parse the raw line.
+
+  HARD-WON os_regex / Wazuh gotchas verified on 4.14.5 (all cost a reload to discover):
+    1. pcre2 <prematch> on a first-level decoder (no <program_name>) does NOT reliably match.
+       Use native os_regex (like the stock web-accesslog decoder, which DOES match these lines).
+    2. os_regex chokes on a literal '<PRI>' sub-pattern ('<\d+>'); match each leading token with
+       \S+ instead (\S matches the '<86>1' bytes fine; only the literal angle-bracket pattern fails).
+    3. The prematch + regex must be '^'-anchored for field extraction to fire.
+    4. A decoder that is a PARENT (has child decoders) does NOT run its own <regex>/<order> — it is
+       only a prematch gate. So 'truenas' (which extracts truenas_app via its own <regex>/<order>)
+       must stay CHILDLESS. New SSH extractors are therefore SEPARATE first-level decoders ordered
+       BEFORE 'truenas' (more specific prematch wins), NOT children of 'truenas'.
+    5. Among first-level decoders the FIRST whose prematch matches wins (and stops). Order is:
+       'truenas-tnaudit' (@cee JSON) -> 'truenas-sshd-*' (specific sshd-session lines) -> 'truenas'
+       (generic app-name fallback, last).
+    6. JSON_Decoder does NOT recurse into double-encoded JSON strings. TrueNAS stores
+       TNAUDIT.event_data and TNAUDIT.svc_data as serialized JSON *strings*, so dotted paths like
+       TNAUDIT.event_data.method DO NOT EXIST. Rules must regex-match the whole TNAUDIT.event_data
+       string value. Only genuinely-nested objects (TNAUDIT.vers, sudo.reject, sudo.accept) decode
+       into dotted fields.
+
+  CANONICAL FIELDS: the 'truenas-sshd-*' decoders map the real remote SSH
+  address/user into Wazuh's canonical srcip / srcuser. MISP IP-IOC rules (100210/100211) auto-flag known-bad
+  addresses, and same_source_ip frequency rules work for brute-force detection.
+
+  WHY NO srcip ON TNAUDIT: we deliberately do NOT map TNAUDIT.addr -> srcip. Two hard reasons:
+    (a) Empirically (1194 audit events) TNAUDIT.addr is 127.0.0.1 for all but one — it is the
+        middleware's loopback self-view, not a useful client IP, so MISP correlation on it is moot.
+    (b) Wazuh will not let you add canonical fields to a JSON-plugin decoder anyway: a child decoder
+        SUPPRESSES the parent's plugin_decoder (verified on 4.14.5 — TNAUDIT.* vanish), and combining
+        <regex>/<order> with <plugin_decoder> in one decoder is a hard config error (2111).
+    The real external attack surface (SSH brute force from routable IPs) is captured with proper
+    srcip by the sshd decoders below, so MISP/geo/frequency correlation works where it matters.
+    TNAUDIT rules key on TNAUDIT.addr / TNAUDIT.user directly (as the existing 100345-100359 do).
+
+  TNAUDIT_SYSTEM / TNAUDIT_MIDDLEWARE are the high-value sub-source (TrueNAS middleware audit).
+  JSON_Decoder parses from immediately after the '@cee:' prematch -> TNAUDIT.* fields:
+  event, success, user, addr, svc, svc_data(str), event_data(str), vers.* ; and for sudo lines
+  -> sudo.reject.* / sudo.accept.* .
+-->
+
+<!-- (1) TNAUDIT middleware audit + sudo @cee:{json}.  Listed FIRST so it wins over 'truenas' for
+        these lines.  prematch '@cee:' positions JSON_Decoder exactly at the '{'.  Handles BOTH
+        @cee:{"TNAUDIT":...} and @cee:{"sudo":...} (sudo reject/accept). -->
+<decoder name="truenas-tnaudit">
+  <prematch>@cee:</prematch>
+  <plugin_decoder offset="after_prematch">JSON_Decoder</plugin_decoder>
+</decoder>
+
+<!-- (2) TrueNAS SSH (program 'sshd-session').  Separate first-level decoders, ordered BEFORE
+        'truenas' so the specific prematch wins; each extracts canonical srcuser/srcip.
+        program_name is NOT usable here (empty due to the ISO8601 pre-decoder miss, gotcha #2),
+        so we anchor on the raw octet/PRI/ts/host/app token sequence like 'truenas' does.
+        Rules key on these via <decoded_as>. -->
+
+<!-- (2a) Accepted login:  "... true sshd-session <pid> - - Accepted <method> for <user> from <ip> port .." -->
+<decoder name="truenas-sshd-accept">
+  <prematch>^\d+ \S+ \d\d\d\d-\d\d-\d\dT\S+ true sshd-session \S+ \S+ \S+ Accepted </prematch>
+  <regex offset="after_prematch">^\S+ for (\S+) from (\S+) port</regex>
+  <order>srcuser,srcip</order>
+</decoder>
+
+<!-- (2b) Failed login:  "... Failed <method> for [invalid user ]<user> from <ip> port .."
+         Every failed SSH attempt (valid or invalid user) emits a "Failed password" line, so this
+         one decoder is sufficient for brute-force detection. The optional "invalid user " infix is
+         skipped so srcuser captures the actual attempted username in both shapes. -->
+<decoder name="truenas-sshd-fail">
+  <prematch type="pcre2">^\d+ \S+ \d{4}-\d{2}-\d{2}T\S+ true sshd-session \S+ \S+ \S+ Failed </prematch>
+  <regex offset="after_prematch" type="pcre2">^\S+ for (?:invalid user )?(\S+) from (\S+) port</regex>
+  <order>srcuser,srcip</order>
+</decoder>
+
+<!-- (3) Any other TrueNAS RFC5424 line (general syslog: smartd, zed, systemd, kernel, ...): extract
+        the app-name into truenas_app. Childless, so its <regex> runs. Ordered LAST so the specific
+        @cee/sshd decoders win first. Unchanged from the original working decoder. -->
+<decoder name="truenas">
+  <prematch>^\d+ \S+ \d\d\d\d-\d\d-\d\dT\S+ true </prematch>
+  <regex offset="after_prematch">^(\S+)</regex>
+  <order>truenas_app</order>
+</decoder>

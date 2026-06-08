@@ -1,0 +1,389 @@
+<!--
+  TrueNAS SCALE classification rules (paired with truenas_decoders.xml).
+
+  Keyed off DECODED FIELDS (truenas_app / TNAUDIT.* / sudo.* / canonical srcip+srcuser), not
+  <decoded_as> for the JSON path, because a parent decoder ('truenas') and the JSON decoder
+  ('truenas-tnaudit') both feed these rules. SSH rules DO use <decoded_as> against the dedicated
+  sshd decoders.
+
+  GROUND TRUTH ( live TNAUDIT events + general syslog):
+    - event=GENERIC is 97% of the audit feed (internal middleware, all localhost) -> suppressed L0.
+    - TNAUDIT.addr is 127.0.0.1 for all but one event (middleware loopback self-view), so the real
+      external attack surface is SSH (sshd-session, real srcip) -> canonical srcip/srcuser there.
+    - TNAUDIT.event_data and svc_data are JSON *strings* (NOT dotted fields) -> match with pcre2
+      regex on the whole string (see decoder note #6).
+    - METHOD_CALL carries {"method":"<api>", ...} in event_data; ESCALATION carries the executed
+      binary in event_data "proctitle"; MIDDLEWARE AUTH carries the credential type in event_data
+      "credentials" (UNIX_SOCKET = internal, API_KEY/TOKEN = elevated).
+
+  Level discipline (Shuffle triage gate = level 10): single events stay <10; only frequency
+  composites or near-zero-FP events (data destruction, API-key ops, SSH brute force) reach >=10.
+
+  FORWARD-LOOKING rules (no positive sample in the healthy-box capture; decoder paths validated
+  with synthetic lines via wazuh-logtest): data destruction 100374, api-key 100371, config 100372,
+  service 100373, share 100375, app 100376, replication 100377, boot/update 100378, storage health
+  100383/100384/100385, SSH brute force 100365. These fire when the corresponding event occurs.
+-->
+
+<group name="truenas,syslog,">
+
+  <!-- ===== Base: any decoded TrueNAS syslog line ===== -->
+  <rule id="100340" level="2">
+    <field name="truenas_app">\.+</field>
+    <description>TrueNAS ($(truenas_app)) event.</description>
+    <group>truenas_event,</group>
+  </rule>
+
+  <!-- ===== Noise suppression (kept below the L3 index/alert threshold) ===== -->
+  <!-- Forwarded kernel logs are almost all Docker/k3s veth bridge churn on this box. -->
+  <rule id="100341" level="1">
+    <if_sid>100340</if_sid>
+    <field name="truenas_app">^kernel$</field>
+    <description>TrueNAS kernel message (low priority).</description>
+  </rule>
+  <!-- Container runtime + init + syslog-ng internal churn. -->
+  <rule id="100342" level="1">
+    <if_sid>100340</if_sid>
+    <field name="truenas_app" type="pcre2">^(containerd|dockerd|systemd|syslog-ng)$</field>
+    <description>TrueNAS container/runtime housekeeping (low priority).</description>
+  </rule>
+  <!-- Internal cron / middleware ('ed') PAM sessions for root = housekeeping, not interactive logins. -->
+  <rule id="100343" level="1">
+    <if_sid>100340</if_sid>
+    <field name="truenas_app" type="pcre2">^(CRON|ed)$</field>
+    <match>pam_unix</match>
+    <description>TrueNAS internal PAM session (cron/middleware, low priority).</description>
+  </rule>
+
+  <!-- ===== Storage health (smartd / zed / zfs syslog) =====
+       TrueNAS forwards general syslog; smartd/zed/zfs disk+pool events decode via 'truenas'
+       (truenas_app). Operational, not ATT&CK, so no <mitre>. Forward-looking: the healthy-box
+       capture had none, but these fire on real disk/pool trouble. -->
+  <rule id="100383" level="5">
+    <if_sid>100340</if_sid>
+    <field name="truenas_app" type="pcre2">^(smartd|zed|zfs|zfsd|zpool)$</field>
+    <description>TrueNAS storage health event ($(truenas_app)): $(full_log)</description>
+    <group>truenas_storage,storage_health,</group>
+  </rule>
+  <!-- Critical disk/pool state (DEGRADED/FAULTED/OFFLINE) that does NOT trip the stock generic
+       error rule 1002, so it reaches us via the 100383 path. L9: alerted + on the dashboard, just
+       below the L10 security triage gate (storage health is operational, not a security incident;
+       tune to L10 if you want pool failures to page security triage). -->
+  <rule id="100384" level="9">
+    <if_sid>100383</if_sid>
+    <match type="pcre2">(?i)(DEGRADED|FAULTED|REMOVED|UNAVAIL|OFFLINE|FAILED|Offline uncorrectable|Currently unreadable|self-health.*fail|scrub.*error|pool.*error)</match>
+    <description>TrueNAS CRITICAL storage state ($(truenas_app)) — ZFS pool DEGRADED/FAULTED or SMART drive failure.</description>
+    <group>truenas_storage,storage_health,storage_critical,</group>
+  </rule>
+  <!-- Storage/IO error lines from smartd/zed/kernel that DO contain an error keyword get caught by
+       the stock generic rule 1002 (which preempts the 100340 subtree). Re-classify by chaining off
+       1002: scoped to TrueNAS storage daemons + an actual disk/IO/ZFS error pattern. This reuses
+       the existing generic rule rather than recreating error handling. -->
+  <rule id="100385" level="9">
+    <if_sid>1002</if_sid>
+    <field name="truenas_app" type="pcre2">^(smartd|zed|zfs|zfsd|zpool|kernel)$</field>
+    <match type="pcre2">(?i)(I/O error|critical medium error|medium error|EXT4-fs error|Buffer I/O error|FAILED SMART|self-health.*fail|ata\d+.*(failed|error|frozen)|ZFS.*(DEGRADED|FAULTED|error)|blk_update_request.*error|read error|write error|unreadable)</match>
+    <description>TrueNAS storage/IO error ($(truenas_app)) — possible failing disk or ZFS vdev problem: $(full_log)</description>
+    <group>truenas_storage,storage_health,storage_critical,</group>
+  </rule>
+
+  <!-- ===== SSH (program sshd-session) =====
+       Dedicated decoders set canonical srcuser/srcip (real remote IPs) -> MISP IP-IOC rules
+       100210/100211 auto-flag known-bad SSH sources, and same_source_ip frequency works. -->
+  <rule id="100363" level="5">
+    <decoded_as>truenas-sshd-accept</decoded_as>
+    <description>TrueNAS SSH login accepted for $(srcuser) from $(srcip).</description>
+    <group>truenas_sshd,authentication_success,</group>
+    <mitre><id>T1021.004</id><id>T1078</id></mitre>
+  </rule>
+  <rule id="100364" level="5">
+    <decoded_as>truenas-sshd-fail</decoded_as>
+    <description>TrueNAS SSH authentication failure for $(srcuser) from $(srcip).</description>
+    <group>truenas_sshd,authentication_failed,</group>
+    <mitre><id>T1110.001</id></mitre>
+  </rule>
+  <!-- Repeated SSH failures from one source -> brute force (reaches the L10 triage gate). -->
+  <rule id="100365" level="10" frequency="5" timeframe="120">
+    <if_matched_sid>100364</if_matched_sid>
+    <same_source_ip />
+    <description>TrueNAS SSH brute force — 5+ auth failures from $(srcip) in 120s.</description>
+    <group>truenas_sshd,authentication_failures,brute_force,</group>
+    <mitre><id>T1110.001</id><id>T1110.003</id></mitre>
+  </rule>
+
+  <!-- ===== sudo (program sudo, @cee JSON -> sudo.reject.* / sudo.accept.*) ===== -->
+  <!-- sudo command REJECTED (auth/policy denial) — user probing privilege boundaries. -->
+  <rule id="100366" level="7">
+    <field name="sudo.reject.command">\.+</field>
+    <description>TrueNAS sudo REJECTED for $(sudo.reject.submituser) running '$(sudo.reject.command)' — $(sudo.reject.reason).</description>
+    <group>truenas_sudo,privilege_escalation,</group>
+    <mitre><id>T1548.003</id></mitre>
+  </rule>
+  <!-- sudo command ACCEPTED (privilege successfully used). -->
+  <rule id="100367" level="5">
+    <field name="sudo.accept.command">\.+</field>
+    <description>TrueNAS sudo accepted for $(sudo.accept.submituser) running '$(sudo.accept.command)' as $(sudo.accept.runuser).</description>
+    <group>truenas_sudo,privilege_escalation,</group>
+    <mitre><id>T1548.003</id></mitre>
+  </rule>
+  <!-- sudo to a shell or destructive command -> high-risk (reaches triage gate). -->
+  <rule id="100368" level="10">
+    <if_sid>100367</if_sid>
+    <field name="sudo.accept.command" type="pcre2">(?i)(/bin/bash|/bin/sh|/bin/zsh|/usr/bin/python|zfs\s+destroy|zpool\s+destroy|/usr/bin/midclt|\bdd\b|mkfs)</field>
+    <description>TrueNAS sudo to SHELL or destructive command by $(sudo.accept.submituser): '$(sudo.accept.command)' — high-risk.</description>
+    <group>truenas_sudo,privilege_escalation,attack,</group>
+    <mitre><id>T1548.003</id><id>T1059.004</id></mitre>
+  </rule>
+
+  <!-- ===== TNAUDIT middleware audit (JSON @cee) =====
+       Independent root rule: TNAUDIT lines set TNAUDIT.* but NOT truenas_app, so this canNOT
+       chain off 100340. -->
+  <rule id="100345" level="3">
+    <field name="TNAUDIT.event">\.+</field>
+    <description>TrueNAS audit: $(TNAUDIT.event) user=$(TNAUDIT.user) addr=$(TNAUDIT.addr) success=$(TNAUDIT.success)</description>
+    <group>truenas,syslog,truenas_audit,</group>
+  </rule>
+
+  <!-- GENERIC internal middleware audit = 97% of volume -> drop. -->
+  <rule id="100346" level="0">
+    <if_sid>100345</if_sid>
+    <field name="TNAUDIT.event">^GENERIC$</field>
+    <description>TrueNAS audit: internal GENERIC event (suppressed).</description>
+  </rule>
+
+  <!-- Internal localhost credential checks = low value. -->
+  <rule id="100347" level="2">
+    <if_sid>100345</if_sid>
+    <field name="TNAUDIT.event">^CREDENTIAL$</field>
+    <field name="TNAUDIT.addr">^127.0.0.1$</field>
+    <description>TrueNAS audit: internal credential check (localhost) user=$(TNAUDIT.user).</description>
+  </rule>
+
+  <!-- Privilege escalation / elevation audit events (observed live: event=ESCALATION). Security-
+       relevant; visible + indexed but below the triage gate by default. -->
+  <rule id="100348" level="4">
+    <if_sid>100345</if_sid>
+    <field name="TNAUDIT.event" type="pcre2">^(ESCALATION|PRIVILEGE|SUDO|ELEVATION)$</field>
+    <description>TrueNAS: privilege escalation ($(TNAUDIT.event)) by user $(TNAUDIT.user) from $(TNAUDIT.addr).</description>
+    <group>truenas_audit,privilege_escalation,</group>
+    <mitre><id>T1548</id></mitre>
+  </rule>
+  <!-- High-risk escalation: the executed binary (event_data "proctitle") is a shell or a
+       destructive ZFS/midclt command -> reaches triage gate. -->
+  <rule id="100380" level="10">
+    <if_sid>100348</if_sid>
+    <field name="TNAUDIT.event_data" type="pcre2">"proctitle":\s*"[^"]*(/bin/bash|/bin/sh|/bin/zsh|zfs destroy|zpool destroy|/usr/bin/midclt|\bdd if=|mkfs)</field>
+    <description>TrueNAS: HIGH-RISK privilege escalation to shell/destructive command by $(TNAUDIT.user).</description>
+    <group>truenas_audit,privilege_escalation,attack,</group>
+    <mitre><id>T1548</id><id>T1059.004</id></mitre>
+  </rule>
+  <!-- Benign per-login escalation (systemd per-user environment setup) = 77/26min in the sample;
+       de-rate to keep the escalation dashboard readable. -->
+  <rule id="100379" level="2">
+    <if_sid>100348</if_sid>
+    <field name="TNAUDIT.event_data" type="pcre2">"proctitle":\s*"/(bin|usr/bin)/systemctl --user</field>
+    <description>TrueNAS: routine per-login escalation (systemctl --user, suppressed).</description>
+    <group>truenas_audit,privilege_escalation,</group>
+  </rule>
+
+  <!-- Real authentication / login success. -->
+  <rule id="100350" level="4">
+    <if_sid>100345</if_sid>
+    <field name="TNAUDIT.event" type="pcre2">^(AUTHENTICATION|LOGIN)$</field>
+    <field name="TNAUDIT.success">^true$</field>
+    <description>TrueNAS: successful $(TNAUDIT.event) for user $(TNAUDIT.user) from $(TNAUDIT.addr).</description>
+    <group>authentication_success,truenas_audit,</group>
+    <mitre><id>T1078</id></mitre>
+  </rule>
+  <!-- Internal UNIX_SOCKET middleware session auth (WebUI/API self-calls, addr=127.0.0.1) is the
+       high-volume baseline -> de-rate to keep auth dashboards readable. -->
+  <rule id="100381" level="2">
+    <if_sid>100350</if_sid>
+    <field name="TNAUDIT.svc">^MIDDLEWARE$</field>
+    <field name="TNAUDIT.event_data" type="pcre2">"credentials":\s*"UNIX_SOCKET"</field>
+    <description>TrueNAS: internal middleware socket authentication (operational, suppressed).</description>
+    <group>authentication_success,truenas_audit,</group>
+  </rule>
+  <!-- API key / token authentication: bypasses interactive 2FA -> slightly elevated visibility.
+       Forward-looking (sample only had UNIX_SOCKET). -->
+  <rule id="100382" level="6">
+    <if_sid>100350</if_sid>
+    <field name="TNAUDIT.event_data" type="pcre2">"credentials":\s*"(API_KEY|TOKEN|API_KEY_PLAIN)"</field>
+    <description>TrueNAS: authentication via API key/token for user $(TNAUDIT.user) from $(TNAUDIT.addr) — review credential type.</description>
+    <group>authentication_success,truenas_audit,</group>
+    <mitre><id>T1078</id><id>T1098.001</id></mitre>
+  </rule>
+
+  <!-- Failed authentication / login (single event; below the triage gate). -->
+  <rule id="100351" level="8">
+    <if_sid>100345</if_sid>
+    <field name="TNAUDIT.event" type="pcre2">^(AUTHENTICATION|LOGIN)$</field>
+    <field name="TNAUDIT.success">^false$</field>
+    <description>TrueNAS: FAILED $(TNAUDIT.event) for user $(TNAUDIT.user) from $(TNAUDIT.addr).</description>
+    <group>authentication_failed,truenas_audit,</group>
+    <mitre><id>T1110.001</id></mitre>
+  </rule>
+
+  <!-- Repeated failed auth -> possible brute force (reaches the level-10 triage gate). -->
+  <rule id="100352" level="10" frequency="6" timeframe="180">
+    <if_matched_sid>100351</if_matched_sid>
+    <description>TrueNAS: multiple failed authentications (possible brute force).</description>
+    <group>authentication_failures,truenas_audit,brute_force,</group>
+    <mitre><id>T1110.001</id><id>T1110.003</id></mitre>
+  </rule>
+
+  <!-- Logout / session end (visibility only). -->
+  <rule id="100353" level="3">
+    <if_sid>100345</if_sid>
+    <field name="TNAUDIT.event" type="pcre2">^(LOGOUT|LOGOFF)$</field>
+    <description>TrueNAS: $(TNAUDIT.event) for user $(TNAUDIT.user).</description>
+    <group>truenas_audit,</group>
+  </rule>
+
+  <!-- ===== External-origin CREDENTIAL failures =====
+       SYSTEM-svc CREDENTIAL checks (PAM:bad_ident) from a non-localhost address. Observed live as
+       repeated SSH cred failures. Elevate to L7 (visible/indexed, below triage); repeats -> L10. -->
+  <rule id="100357" level="7">
+    <if_sid>100345</if_sid>
+    <field name="TNAUDIT.event">^CREDENTIAL$</field>
+    <field name="TNAUDIT.success">^false$</field>
+    <field name="TNAUDIT.addr" negate="yes">^127\.0\.0\.1$</field>
+    <description>TrueNAS: failed credential check from external address $(TNAUDIT.addr).</description>
+    <group>authentication_failed,truenas_audit,</group>
+    <mitre><id>T1110.001</id></mitre>
+  </rule>
+  <rule id="100358" level="10" frequency="5" timeframe="300">
+    <if_matched_sid>100357</if_matched_sid>
+    <description>TrueNAS: repeated external credential failures — possible SSH/API brute force.</description>
+    <group>authentication_failures,truenas_audit,brute_force,</group>
+    <mitre><id>T1110.001</id><id>T1110.003</id></mitre>
+  </rule>
+
+  <!-- ===== MIDDLEWARE METHOD_CALL category rules =====
+       event_data is a JSON string carrying {"method":"<api>", ...}; matched with pcre2 regex.
+       Placed BEFORE the generic remote-API rule 100359 so a specific high-severity classification
+       wins for the (rare) remote case. Methods are disjoint so sibling order among them is moot.
+       Most are forward-looking (only app.create was in the sample); decoder path validated. -->
+
+  <!-- Data destruction: dataset/snapshot/pool delete or export. Ransomware deletes snapshots to
+       inhibit recovery. Near-zero FP -> L10. -->
+  <rule id="100374" level="10">
+    <if_sid>100345</if_sid>
+    <field name="TNAUDIT.event">^METHOD_CALL$</field>
+    <field name="TNAUDIT.event_data" type="pcre2">"method":\s*"(pool\.dataset\.delete|pool\.dataset\.snapshot\.delete|pool\.snapshot\.delete|zfs\.snapshot\.delete|pool\.dataset\.destroy_snapshots|pool\.destroy|pool\.export)"</field>
+    <description>TrueNAS: DATA DESTRUCTION — dataset/snapshot/pool delete or export by $(TNAUDIT.user) from $(TNAUDIT.addr).</description>
+    <group>truenas_storage,data_destruction,attack,</group>
+    <mitre><id>T1485</id><id>T1490</id></mitre>
+  </rule>
+
+  <!-- API key / token / password credential operations: API keys bypass 2FA. Near-zero FP -> L10. -->
+  <rule id="100371" level="10">
+    <if_sid>100345</if_sid>
+    <field name="TNAUDIT.event">^METHOD_CALL$</field>
+    <field name="TNAUDIT.event_data" type="pcre2">"method":\s*"(api_key\.|auth\.generate_token|auth\.generate_onetime_password|user\.set_password|privilege\.)</field>
+    <description>TrueNAS: API key/token/credential operation ($(TNAUDIT.event_data)) by $(TNAUDIT.user) from $(TNAUDIT.addr).</description>
+    <group>truenas_account,credential_access,</group>
+    <mitre><id>T1098</id><id>T1098.001</id><id>T1552.001</id></mitre>
+  </rule>
+
+  <!-- Account / group lifecycle change. -->
+  <rule id="100370" level="8">
+    <if_sid>100345</if_sid>
+    <field name="TNAUDIT.event">^METHOD_CALL$</field>
+    <field name="TNAUDIT.event_data" type="pcre2">"method":\s*"(user|group|account)\.(create|update|delete|do_create|do_update|do_delete)</field>
+    <description>TrueNAS: account/group lifecycle change ($(TNAUDIT.event_data)) by $(TNAUDIT.user) from $(TNAUDIT.addr).</description>
+    <group>truenas_account,account_changed,</group>
+    <mitre><id>T1136</id><id>T1098</id></mitre>
+  </rule>
+
+  <!-- System / network / certificate / security config change. Syslog/audit-target changes can
+       blind the SIEM -> high-value. -->
+  <rule id="100372" level="8">
+    <if_sid>100345</if_sid>
+    <field name="TNAUDIT.event">^METHOD_CALL$</field>
+    <field name="TNAUDIT.event_data" type="pcre2">"method":\s*"(system\.(general|advanced|security)\.update|system\.advanced\.update_gpos|network\.(configuration|interface)\.|certificate\.|truenas\.set_production|kmip\.|datastore\.)</field>
+    <description>TrueNAS: system/network/certificate configuration change ($(TNAUDIT.event_data)) by $(TNAUDIT.user).</description>
+    <group>truenas_config,config_changed,</group>
+    <mitre><id>T1562.001</id><id>T1553.004</id></mitre>
+  </rule>
+
+  <!-- Service start/stop/update. Stopping ssh/smb/audit abnormally = defense impairment. -->
+  <rule id="100373" level="8">
+    <if_sid>100345</if_sid>
+    <field name="TNAUDIT.event">^METHOD_CALL$</field>
+    <field name="TNAUDIT.event_data" type="pcre2">"method":\s*"service\.(update|start|stop|restart|control)"</field>
+    <description>TrueNAS: service start/stop/update ($(TNAUDIT.event_data)) by $(TNAUDIT.user) from $(TNAUDIT.addr).</description>
+    <group>truenas_config,service_changed,</group>
+    <mitre><id>T1562.001</id></mitre>
+  </rule>
+
+  <!-- File-share configuration change (SMB / NFS / iSCSI) -> potential data exposure. -->
+  <rule id="100375" level="8">
+    <if_sid>100345</if_sid>
+    <field name="TNAUDIT.event">^METHOD_CALL$</field>
+    <field name="TNAUDIT.event_data" type="pcre2">"method":\s*"(sharing\.(smb|nfs)\.|iscsi\.|nfs\.)</field>
+    <description>TrueNAS: file-share configuration change (SMB/NFS/iSCSI) ($(TNAUDIT.event_data)) by $(TNAUDIT.user).</description>
+    <group>truenas_config,share_changed,</group>
+    <mitre><id>T1135</id><id>T1039</id></mitre>
+  </rule>
+
+  <!-- Replication / cloud-sync / rsync task change -> potential data-egress vector. -->
+  <rule id="100377" level="8">
+    <if_sid>100345</if_sid>
+    <field name="TNAUDIT.event">^METHOD_CALL$</field>
+    <field name="TNAUDIT.event_data" type="pcre2">"method":\s*"(replication\.|cloudsync\.|cloud_sync\.|rsynctask\.|rsync\.)</field>
+    <description>TrueNAS: replication/cloud-sync change ($(TNAUDIT.event_data)) by $(TNAUDIT.user) — verify data egress destination.</description>
+    <group>truenas_config,data_exfil,</group>
+    <mitre><id>T1537</id><id>T1020</id></mitre>
+  </rule>
+
+  <!-- Boot environment / system update / power state. -->
+  <rule id="100378" level="7">
+    <if_sid>100345</if_sid>
+    <field name="TNAUDIT.event">^METHOD_CALL$</field>
+    <field name="TNAUDIT.event_data" type="pcre2">"method":\s*"(boot\.environment|bootenv\.|update\.(download|update|manual|file)|system\.(reboot|shutdown))</field>
+    <description>TrueNAS: boot environment / system update / power-state change ($(TNAUDIT.event_data)) by $(TNAUDIT.user).</description>
+    <group>truenas_config,config_changed,</group>
+    <mitre><id>T1542</id><id>T1529</id></mitre>
+  </rule>
+
+  <!-- Application / container / catalog lifecycle change. -->
+  <rule id="100376" level="7">
+    <if_sid>100345</if_sid>
+    <field name="TNAUDIT.event">^METHOD_CALL$</field>
+    <field name="TNAUDIT.event_data" type="pcre2">"method":\s*"(app|chart_release|docker|container|catalog)\.</field>
+    <description>TrueNAS: application/container lifecycle change ($(TNAUDIT.event_data)) by $(TNAUDIT.user) from $(TNAUDIT.addr).</description>
+    <group>truenas_config,app_changed,</group>
+    <mitre><id>T1610</id></mitre>
+  </rule>
+
+  <!-- Remote TrueNAS API call from non-localhost (generic catch; specific method rules above win).
+       All observed METHOD_CALLs are addr=127.0.0.1; a remote addr means external API access. -->
+  <rule id="100359" level="7">
+    <if_sid>100345</if_sid>
+    <field name="TNAUDIT.event">^METHOD_CALL$</field>
+    <field name="TNAUDIT.addr" negate="yes">^127\.0\.0\.1$</field>
+    <description>TrueNAS: API METHOD_CALL from remote address $(TNAUDIT.addr) by user $(TNAUDIT.user) — possible external API access.</description>
+    <group>truenas_audit,authentication_success,</group>
+    <mitre><id>T1078</id></mitre>
+  </rule>
+
+  <!-- ===== Legacy sshd app rules (stock 'sshd' program name) =====
+       NOTE: TrueNAS SCALE emits SSH under program 'sshd-session', handled by 100363-100365 above.
+       These remain for any host that logs plain 'sshd' (truenas_app=sshd). -->
+  <rule id="100355" level="5">
+    <if_sid>100340</if_sid>
+    <field name="truenas_app">^sshd$</field>
+    <match type="pcre2">Failed password|authentication failure|Invalid user|Connection closed by authenticating</match>
+    <description>TrueNAS sshd: authentication failure.</description>
+    <group>authentication_failed,truenas_ssh,</group>
+    <mitre><id>T1110.001</id></mitre>
+  </rule>
+  <rule id="100356" level="10" frequency="8" timeframe="120">
+    <if_matched_sid>100355</if_matched_sid>
+    <description>TrueNAS sshd: multiple authentication failures (possible brute force).</description>
+    <group>authentication_failures,truenas_ssh,brute_force,</group>
+    <mitre><id>T1110.001</id><id>T1110.003</id></mitre>
+  </rule>
+
+</group>

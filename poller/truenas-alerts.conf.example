@@ -1,0 +1,21 @@
+# truenas_alerts.py configuration. Copy to /etc/truenas-alerts.conf (or any path passed with
+# --config / $TRUENAS_ALERTS_CONFIG), owned by the user that runs the poller, then: chmod 600 <file>
+# The poller refuses to start if the file is readable by group/other.
+
+TRUENAS_HOST=<TRUENAS IP OR HOSTNAME>
+TRUENAS_PORT=443
+# API key of the dedicated READ-ONLY user (see README). Never put it on the command line.
+TRUENAS_API_KEY=<API KEY>
+
+# TLS: verification is ON by default. For the stock self-signed TrueNAS UI certificate, export the
+# certificate (System > Certificates) and point TRUENAS_CA_FILE at it (its SAN must cover
+# TRUENAS_HOST). TRUENAS_VERIFY_TLS=false disables verification entirely (warns on every run).
+#TRUENAS_CA_FILE=/etc/ssl/truenas-ui.pem
+#TRUENAS_VERIFY_TLS=false
+
+# File the Wazuh manager reads (<localfile> log_format json) and where run-to-run state is kept.
+TRUENAS_ALERTS_OUT=/var/log/truenas-alerts.json
+#TRUENAS_ALERTS_STATE_DIR=/var/lib/truenas-alerts
+
+# Optional: comma-separated, case-insensitive alert-class substrings to drop.
+#TRUENAS_SKIP_KLASS=Certificate
